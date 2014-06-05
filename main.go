@@ -6,14 +6,17 @@ import (
 	"time"
 
 	"os"
-	"fmt"
 	"log"
 	"flag"
+	"io"
+	"io/ioutil"
 )
 
-const PROGRAM_NAME = "netfilter"
+const PROGRAM_NAME = "netserve"
 
 var (
+	verbose = flag.Bool("v", false, "print additional program information")
+
 	ssl = flag.Bool("ssl", false, "use ssl for remote connection")
 	path = flag.String("path", PROGRAM_NAME + ".sock", "unix socket path name")
 	host string
@@ -23,27 +26,29 @@ var (
 		InsecureSkipVerify: true,
 	}
 
-	newRecvFilter, newSendFilter NewFilter
+	ERROR = log.New(os.Stderr, PROGRAM_NAME + ": ERROR: ", log.LstdFlags)
 )
 
 func init () {
 	flag.Usage = func () {
-		fmt.Fprintln(os.Stderr, "usage: " + PROGRAM_NAME + " [options] host port")
+		ERROR.Println("usage: " + PROGRAM_NAME + " [options] host port")
 		flag.PrintDefaults()
 	}
-
-	flag.Var(&newRecvFilter, "recvfilter", "set the receive filter")
-	flag.Var(&newSendFilter, "sendfilter", "set the send filter")
 }
 
 func main () {
 	flag.Parse()
+	
+	if !*verbose {
+		log.SetOutput(ioutil.Discard)
+	}
 
 	if flag.NArg() < 2 {
-		fmt.Fprintln(os.Stderr, "missing arguments")
+		ERROR.Println("missing arguments")
 		flag.Usage()
 		os.Exit(1)
 	}
+
 	host, port = flag.Arg(0), flag.Arg(1)
 
 	send := make(chan []byte, 1)
@@ -56,20 +61,20 @@ func main () {
 
 	local, err := net.Listen("unix", *path)
 	if err != nil {
-		log.Fatal(err)
+		ERROR.Fatal(err)
 	}
 
 	con, err := local.Accept()
 
 	if err != nil {
 		local.Close()
-		log.Fatalf("error waiting for initial client on %q: %s", *path, err)
+		ERROR.Fatalf("error waiting for initial client on %q: %s", *path, err)
 	}
 
 	remote, err := net.DialTimeout("tcp", host + ":" + port, 30 * time.Second)
 	if err != nil {
 		local.Close()
-		log.Fatalf("could not connect to \"%s:%s\": %s\n", host, port, err)
+		ERROR.Fatalf("could not connect to \"%s:%s\": %s\n", host, port, err)
 	}
 
 	if *ssl {
@@ -86,26 +91,27 @@ func main () {
 		senderQuit := make(chan int, 1)
 		recverQuit := make(chan int, 1)
 
-		go func (newRecvFilter NewFilter) {
-			s := newRecvFilter(con)
+		go func () {
 			for {
 				select {
 					default:
-						if !s.Scan() {
-							if s.Err() != nil {
-								log.Println(s.Err())
+						msg := make([]byte, 1024)
+
+						n, err := con.Read(msg)
+						if err != nil {
+							if err != io.EOF {
+								ERROR.Println(err)
 							}
 							recverQuit <-1
+							return
 						}
 
-						msg := make([]byte, len(s.Bytes()))
-						copy(msg, s.Bytes())
-
-						log.Printf(">> %v\n", string(msg))
+						m := msg[:n]
+						log.Printf(">> %v\n", string(m))
 
 						c := <-clients
 						for i := range c {
-							c[i].recv <-msg
+							c[i].recv <-m
 						}
 						clients <-c
 
@@ -114,7 +120,7 @@ func main () {
 						return
 				}
 			}
-		} (newRecvFilter)
+		}()
 
 		for {
 			select {
@@ -122,7 +128,7 @@ func main () {
 					_, err := con.Write(msg)
 
 					if err != nil {
-						log.Println(err)
+						ERROR.Println(err)
 						senderQuit <-1
 						return
 					}
@@ -177,31 +183,32 @@ func (c *Client) Run (send chan []byte, remove chan *Client) {
 	senderQuit := make(chan int, 1)
 	recverQuit := make(chan int, 1)
 
-	go func (newSendFilter NewFilter) {
-		s := newSendFilter(c.con)
+	go func () {
 		for {
 			select {
 				default:
-					if !s.Scan() {
-						if s.Err() != nil {
-							log.Println(s.Err())
+					msg := make([]byte, 1024)
+
+					n, err := c.con.Read(msg)
+
+					if err != nil {
+						if err != io.EOF {
+							ERROR.Println(err)
 						}
 						senderQuit <-1
 						return
 					}
+					m := msg[:n]
 
-					msg := make([]byte, len(s.Bytes()))
-					copy(msg, s.Bytes())
-					
-					log.Printf("<< %v\n", string(msg))
-					send <-msg
+					log.Printf("<< %v\n", string(m))
+					send <-m
 
 				case <-recverQuit:
 					remove <-c
 					return
 			}
 		}
-	}(newSendFilter)
+	}()
 
 	for {
 		select {
